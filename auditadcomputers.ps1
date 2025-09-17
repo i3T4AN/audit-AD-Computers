@@ -2,19 +2,19 @@
 param(
     [Parameter()]
     [string]$Domain = (Get-ADDomain -ErrorAction SilentlyContinue).DNSRoot,
-    
-    [Parameter()]
-    [ValidateNotNullOrEmpty()]
+
+    [Parameter()] 
+    [ValidateNotNullOrEmpty()] 
     [string]$SearchBase,
-    
-    [Parameter()]
+
+    [Parameter()] 
     [switch]$IncludeDisabled,
-    
-    [Parameter()]
-    [ValidateRange(1, 365)]
+
+    [Parameter()] 
+    [ValidateRange(1, 365)] 
     [int]$StaleDays = 180,
-    
-    [Parameter()]
+
+    [Parameter()] 
     [ValidateScript({
         if ($_ -eq '') { return $true }
         $parent = Split-Path $_ -Parent
@@ -25,6 +25,29 @@ param(
     })]
     [string]$OutputFile
 )
+
+# Helper to normalize AD time values (handles Int64 FileTime, DateTime, strings, and "zero"/1601)
+function Convert-AdTime {
+    param([Parameter(ValueFromPipeline=$true)] $Value)
+    process {
+        if ($null -eq $Value) { return $null }
+        try {
+            if ($Value -is [datetime]) {
+                if ($Value.Year -le 1601) { return $null }
+                return [datetime]$Value
+            }
+            if ($Value -is [int64] -or $Value -is [uint64]) {
+                if ([int64]$Value -le 0) { return $null }
+                return [datetime]::FromFileTime([int64]$Value)
+            }
+            # Fallback: try to cast
+            $d = [datetime]$Value
+            if ($d.Year -le 1601) { return $null }
+            return $d
+        }
+        catch { return $null }
+    }
+}
 
 # Check for ActiveDirectory module
 try {
@@ -58,42 +81,32 @@ $staleDate = (Get-Date).AddDays(-$StaleDays)
 $getADComputerParams = @{
     LDAPFilter = $ldapFilter
     Server     = $Domain
-    Properties = @('DNSHostName', 'Enabled', 'OperatingSystem', 'LastLogonTimestamp', 'PasswordLastSet', 'CanonicalName')
+    Properties = @(
+        'DNSHostName','Enabled','OperatingSystem',
+        # Include both so we can handle either shape returned by the module
+        'LastLogonTimestamp','LastLogonDate','PasswordLastSet','CanonicalName'
+    )
 }
-
-if ($SearchBase) {
-    $getADComputerParams['SearchBase'] = $SearchBase
-}
+if ($SearchBase) { $getADComputerParams['SearchBase'] = $SearchBase }
 
 # Query Active Directory
 try {
     Write-Verbose "Querying domain: $Domain"
-    if ($SearchBase) {
-        Write-Verbose "SearchBase: $SearchBase"
-    }
-    
-    $allComputers = Get-ADComputer @getADComputerParams | ForEach-Object {
-        # Convert LastLogonTimestamp (already a FileTime Int64)
-        $lastLogon = if ($_.LastLogonTimestamp -and $_.LastLogonTimestamp -ne 0) {
-            [DateTime]::FromFileTimeUtc([int64]$_.LastLogonTimestamp)
-        } else {
-            $null
-        }
-        
-        # PasswordLastSet is already DateTime, just pass through
-        $passwordLastSet = if ($_.PasswordLastSet) {
-            $_.PasswordLastSet
-        } else {
-            $null
-        }
-        
+    if ($SearchBase) { Write-Verbose "SearchBase: $SearchBase" }
+
+    $allComputers = Get-ADComputer @getADComputerParams -ErrorAction Stop | ForEach-Object {
+        # Normalize LastLogon and PasswordLastSet regardless of underlying type
+        $ll = Convert-AdTime $_.LastLogonDate
+        if (-not $ll) { $ll = Convert-AdTime $_.LastLogonTimestamp }
+        $pls = Convert-AdTime $_.PasswordLastSet
+
         [PSCustomObject]@{
             Name            = $_.Name
             DNSHostName     = $_.DNSHostName
             Enabled         = $_.Enabled
             OperatingSystem = $_.OperatingSystem
-            LastLogonDate   = $lastLogon
-            PasswordLastSet = $passwordLastSet
+            LastLogonDate   = $ll
+            PasswordLastSet = $pls
             CanonicalName   = $_.CanonicalName
         }
     }
@@ -107,33 +120,31 @@ catch {
 if (!$IncludeDisabled) {
     Write-Verbose "Filtering for enabled computers only"
     $computers = $allComputers | Where-Object { $_.Enabled -eq $true }
-    
+
     Write-Verbose "Filtering out stale computers (inactive for $StaleDays+ days)"
     $computers = $computers | Where-Object {
         ($null -ne $_.LastLogonDate -and $_.LastLogonDate -ge $staleDate) -or
         ($null -eq $_.LastLogonDate -and $null -ne $_.PasswordLastSet -and $_.PasswordLastSet -ge $staleDate)
     }
-} else {
+}
+else {
     $computers = $allComputers
 }
 
 # Output computer names to console
+$computers = @($computers) # materialize to count safely
 Write-Verbose "Found $($computers.Count) computer(s) matching criteria"
-$computers | ForEach-Object { Write-Output $_.Name }
+$computers | ForEach-Object { $_.Name }
 
 # Export to CSV if OutputFile specified
 if ($OutputFile) {
     try {
         $exportData = $computers | Select-Object @(
-            'Name'
-            'DNSHostName'
-            'Enabled'
-            'OperatingSystem'
-            @{Name='LastLogonDate'; Expression={ if ($_.LastLogonDate) { $_.LastLogonDate.ToString('yyyy-MM-dd HH:mm:ss') } else { 'Never' } }}
-            @{Name='PasswordLastSet'; Expression={ if ($_.PasswordLastSet) { $_.PasswordLastSet.ToString('yyyy-MM-dd HH:mm:ss') } else { 'Never' } }}
+            'Name','DNSHostName','Enabled','OperatingSystem',
+            @{Name='LastLogonDate'; Expression={ if ($_.LastLogonDate) { $_.LastLogonDate.ToString('yyyy-MM-dd HH:mm:ss') } else { 'Never' } }},
+            @{Name='PasswordLastSet'; Expression={ if ($_.PasswordLastSet) { $_.PasswordLastSet.ToString('yyyy-MM-dd HH:mm:ss') } else { 'Never' } }},
             'CanonicalName'
         )
-        
         $exportData | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
         Write-Verbose "Exported results to: $OutputFile"
     }
