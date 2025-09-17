@@ -53,7 +53,6 @@ $ldapFilter = "(&(objectCategory=computer)(dNSHostName=*))"
 
 # Calculate stale date
 $staleDate = (Get-Date).AddDays(-$StaleDays)
-$staleFileTime = $staleDate.ToFileTime()
 
 # Build Get-ADComputer parameters
 $getADComputerParams = @{
@@ -74,21 +73,20 @@ try {
     }
     
     $allComputers = Get-ADComputer @getADComputerParams | ForEach-Object {
-        # Convert LastLogonTimestamp
+        # Convert LastLogonTimestamp (already a FileTime Int64)
         $lastLogon = if ($_.LastLogonTimestamp -and $_.LastLogonTimestamp -ne 0) {
-            [DateTime]::FromFileTime($_.LastLogonTimestamp)
+            [DateTime]::FromFileTimeUtc([int64]$_.LastLogonTimestamp)
         } else {
             $null
         }
         
-        # Convert PasswordLastSet
-        $passwordLastSet = if ($_.PasswordLastSet -and $_.PasswordLastSet -ne 0) {
-            [DateTime]::FromFileTime($_.PasswordLastSet)
+        # PasswordLastSet is already DateTime, just pass through
+        $passwordLastSet = if ($_.PasswordLastSet) {
+            $_.PasswordLastSet
         } else {
             $null
         }
         
-        # Create custom object with properly formatted data
         [PSCustomObject]@{
             Name            = $_.Name
             DNSHostName     = $_.DNSHostName
@@ -108,9 +106,7 @@ catch {
 # Filter based on enabled status and stale days
 if (!$IncludeDisabled) {
     Write-Verbose "Filtering for enabled computers only"
-    $computers = $allComputers | Where-Object { 
-        $_.Enabled -eq $true
-    }
+    $computers = $allComputers | Where-Object { $_.Enabled -eq $true }
     
     Write-Verbose "Filtering out stale computers (inactive for $StaleDays+ days)"
     $computers = $computers | Where-Object {
@@ -123,33 +119,18 @@ if (!$IncludeDisabled) {
 
 # Output computer names to console
 Write-Verbose "Found $($computers.Count) computer(s) matching criteria"
-$computers | ForEach-Object { 
-    Write-Output $_.Name 
-}
+$computers | ForEach-Object { Write-Output $_.Name }
 
 # Export to CSV if OutputFile specified
 if ($OutputFile) {
     try {
-        # Select specific columns for CSV export
         $exportData = $computers | Select-Object @(
             'Name'
             'DNSHostName'
             'Enabled'
             'OperatingSystem'
-            @{Name='LastLogonDate'; Expression={
-                if ($_.LastLogonDate) {
-                    $_.LastLogonDate.ToString('yyyy-MM-dd HH:mm:ss')
-                } else {
-                    'Never'
-                }
-            }}
-            @{Name='PasswordLastSet'; Expression={
-                if ($_.PasswordLastSet) {
-                    $_.PasswordLastSet.ToString('yyyy-MM-dd HH:mm:ss')
-                } else {
-                    'Never'
-                }
-            }}
+            @{Name='LastLogonDate'; Expression={ if ($_.LastLogonDate) { $_.LastLogonDate.ToString('yyyy-MM-dd HH:mm:ss') } else { 'Never' } }}
+            @{Name='PasswordLastSet'; Expression={ if ($_.PasswordLastSet) { $_.PasswordLastSet.ToString('yyyy-MM-dd HH:mm:ss') } else { 'Never' } }}
             'CanonicalName'
         )
         
